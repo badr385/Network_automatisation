@@ -1,0 +1,36 @@
+import telnetlib
+
+router_ip = 'ip_here'
+router_username = 'user'
+router_password = 'password'
+
+# Function to check if a port is open
+def check_port(ip, port):
+    try:
+        telnetlib.Telnet(ip, port, timeout=5)
+        return True
+    except Exception as e:
+        return False
+
+# Check if HTTP (port 80) is open
+http_open = check_port(router_ip, 80)
+
+# Check if HTTPS (port 443) is open
+https_open = check_port(router_ip, 443)
+
+# Check if telnet (port 23) is open
+telnet_open = check_port(router_ip, 23)
+if http_open:
+    print("HTTP (port 80) is open on the router.")
+else:
+    print("HTTP (port 80) is closed on the router.")
+
+if https_open:
+    print("HTTPS (port 443) is open on the router.")
+else:
+    print("HTTPS (port 443) is closed on the router.")
+
+if telnet_open:
+    print("telnet (port 23) is open on the router.")
+else:
+    print("telnet (port 23) is closed on the router.")
