@@ -1,0 +1,55 @@
+import pandas as pd
+from netmiko import ConnectHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import re
+
+# Function to connect to device and extract IP helper addresses, file excel tree column named hostname,username, password, for password secure way use getpass method. here is an easy example.
+def get_ip_helper_address(device):
+    hostname = device['hostname']
+    username = device['username']
+    password = device['password']
+
+    device_params = {
+        'device_type': 'cisco_ios',
+        'host': hostname,
+        'username': username,
+        'password': password,
+    }
+
+    try:
+        with ConnectHandler(**device_params) as conn:
+            output = conn.send_command('show ip helper-address')
+
+            # Extract IP addresses using regex
+            ip_addresses = re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', output)
+
+            # Format the IPs as a comma-separated string
+            ip_helper_str = ', '.join(ip_addresses) if ip_addresses else 'N/A'
+
+            return {'hostname': hostname, 'ip_helper_address': ip_helper_str}
+
+    except Exception as e:
+        return {'hostname': hostname, 'ip_helper_address': f'Error: {str(e)}'}
+
+
+def main():
+    df = pd.read_excel('devices_file.xlsx')
+    futures = []
+    results = []
+
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        for index, row in df.iterrows():
+            futures.append(executor.submit(get_ip_helper_address, row.to_dict()))
+
+    for future in as_completed(futures):
+        results.append(future.result())
+
+    # Save results
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    df_results = pd.DataFrame(results)
+    df_results.to_excel(f'results_{timestamp}.xlsx', index=False)
+    print(f"Results saved to results_{timestamp}.xlsx")
+
+if __name__ == "__main__":
+    main()
