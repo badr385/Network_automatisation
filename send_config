@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+netmiko_batch_commands.py
+
+- Read hosts from a text file (one per line, # lines ignored).
+- Read commands from a text file (one per line).
+- Send commands concurrently to devices using Netmiko.
+- Save per-host output files under ./outputs/<host>.txt and a summary CSV.
+- Securely prompt for username/password and optional enable/secret.
+- Supports exec-mode (send_command) and config-mode (send_config_set).
+- Optionally stop on per-device command error (detects common Cisco error strings).
+
+Requires: pip install netmiko
+"""
+
+import argparse
+import csv
+import getpass
+import os
+import re
+import socket
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from typing import List, Tuple
+
+from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+
+print_lock = threading.Lock()
+
+# Strings that indicate an error in Cisco/IOS command output (simple heuristics)
+ERROR_MARKERS = [
+    "% Invalid input", "Incomplete command", "Ambiguous command", "Error:",
+    "Bad IP address", "Permission denied", "Authentication failed", "Unknown command"
+]
+
+
+def load_simple_list(path: str) -> List[str]:
+    """Load non-empty, non-comment lines from a file."""
+    items = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            ln = line.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            items.append(ln)
+    return items
+
+
+def ensure_output_dir(path: str = "outputs"):
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def contains_error(output: str) -> bool:
+    if not output:
+        return False
+    for marker in ERROR_MARKERS:
+        if marker.lower() in output.lower():
+            return True
+    return False
+
+
+def send_commands_to_device(host: str, username: str, password: str, secret: str,
+                            commands: List[str], device_type: str, timeout: int,
+                            config_mode: bool, stop_on_error: bool,
+                            output_dir: str) -> Tuple[str, str]:
+    """
+    Connect and send commands. Returns (host, status_message).
+    Writes the per-device output to output_dir/<host>.txt
+    """
+    conn_info = {
+        "device_type": device_type,
+        "host": host,
+        "username": "user",
+        "password": password,
+        "timeout": timeout,
+    }
+
+    try:
+        net_connect = ConnectHandler(**conn_info)
+    except NetmikoTimeoutException:
+        return host, "SSH impossible (timeout)"
+    except NetmikoAuthenticationException:
+        return host, "Authentication failed"
+    except socket.gaierror:
+        return host, "Unresolvable hostname"
+    except OSError as e:
+        if "timed out" in str(e).lower() or "unreachable" in str(e).lower():
+            return host, "SSH impossible (unreachable)"
+        return host, "SSH impossible"
+    except Exception:
+        return host, "SSH impossible"
+
+    try:
+        # Try enter enable if secret provided
+        if secret:
+            try:
+                net_connect.enable()
+            except Exception:
+                try:
+                    net_connect.secret = secret
+                    net_connect.enable()
+                except Exception:
+                    # If enable fails, continue — some devices don't need it
+                    pass
+
+        full_output_parts = []
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        header = f"=== Host: {host}  checked_at: {timestamp}  mode: {'config' if config_mode else 'exec'} ===\n"
+        full_output_parts.append(header)
+
+        if config_mode:
+            # Send config_set (list). Netmiko returns the combined output.
+            try:
+                cfg_output = net_connect.send_config_set(commands, exit_config_mode=True)
+                full_output_parts.append(cfg_output)
+                if contains_error(cfg_output) and stop_on_error:
+                    status = "OK (config error detected — stopped)"
+                else:
+                    status = "OK"
+            except Exception as e:
+                full_output_parts.append(f"\n-- Exception during config: {type(e).__name__}: {e}\n")
+                status = f"Command error ({type(e).__name__})"
+        else:
+            # Exec mode: send each command separately so we can detect per-command errors and stop if desired
+            status = "OK"
+            for cmd in commands:
+                full_output_parts.append(f"\n--- Command: {cmd} ---\n")
+                try:
+                    out = net_connect.send_command(cmd, use_textfsm=False)
+                    full_output_parts.append(out)
+                    if contains_error(out):
+                        status = f"OK (error on command '{cmd}')"
+                        if stop_on_error:
+                            full_output_parts.append(f"\n-- Stopped due to error marker in command output.\n")
+                            break
+                except Exception as e:
+                    full_output_parts.append(f"\n-- Exception executing '{cmd}': {type(e).__name__}: {e}\n")
+                    status = f"Command error ({type(e).__name__})"
+                    if stop_on_error:
+                        break
+
+        try:
+            net_connect.disconnect()
+        except Exception:
+            pass
+
+        # write per-host output
+        safe_name = re.sub(r"[^\w\.-]", "_", host)
+        out_path = os.path.join(output_dir, f"{safe_name}.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(full_output_parts))
+
+        return host, status
+
+    except Exception as e:
+        try:
+            net_connect.disconnect()
+        except Exception:
+            pass
+        return host, f"Command error ({type(e).__name__})"
+
+
+def print_thread_safe(msg: str):
+    with print_lock:
+        print(msg)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Send a list of commands to many devices concurrently using Netmiko.")
+    parser.add_argument("-H", "--hosts-file", required=True, help="File containing hosts (one per line).")
+    parser.add_argument("-c", "--commands-file", required=True, help="File containing commands (one per line).")
+    parser.add_argument("-u", "--username", help="Username (prompted if not provided).")
+    parser.add_argument("-t", "--threads", type=int, default=10, help="Concurrent threads (default 10).")
+    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds (default 30).")
+    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device_type (default cisco_ios).")
+    parser.add_argument("--config", action="store_true", help="Send commands in config mode (send_config_set).")
+    parser.add_argument("--no-stop-on-error", dest="stop_on_error", action="store_false",
+                        help="Do NOT stop executing further commands on that device if an error marker is detected.")
+    parser.add_argument("-o", "--output-dir", default="outputs", help="Directory to write per-host outputs (default ./outputs).")
+    parser.add_argument("-s", "--secret", action="store_true", help="Prompt for enable/secret password.")
+    parser.add_argument("--summary", default="summary.csv", help="CSV summary output file (default summary.csv).")
+    args = parser.parse_args()
+
+    try:
+        hosts = load_simple_list(args.hosts_file)
+    except Exception as e:
+        print(f"Failed to read hosts file '{args.hosts_file}': {e}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        commands = load_simple_list(args.commands_file)
+    except Exception as e:
+        print(f"Failed to read commands file '{args.commands_file}': {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if not hosts:
+        print("No hosts found in hosts file.", file=sys.stderr)
+        sys.exit(2)
+    if not commands:
+        print("No commands found in commands file.", file=sys.stderr)
+        sys.exit(2)
+
+    username = args.username or input("Username: ")
+    password = getpass.getpass("Password: ")
+    secret = getpass.getpass("Enable/secret (press Enter to skip): ") if args.secret else ""
+
+    ensure_output_dir(args.output_dir)
+
+    print(f"\nStarting: {len(hosts)} host(s), {len(commands)} command(s), {args.threads} thread(s). Mode: {'config' if args.config else 'exec'}")
+    print(f"Outputs -> {args.output_dir}/   Summary -> {args.summary}\n")
+
+    results = []
+    start = datetime.now()
+
+    with ThreadPoolExecutor(max_workers=max(1, args.threads)) as executor:
+        future_map = {
+            executor.submit(send_commands_to_device, host, username, password, secret, commands,
+                            args.device_type, args.timeout, args.config, args.stop_on_error, args.output_dir): host
+            for host in hosts
+        }
+
+        # As each completes print a line and store result
+        print(f"{'Host':30} | Status")
+        print("-" * 50)
+        for future in as_completed(future_map):
+            host = future_map[future]
+            try:
+                h, status = future.result()
+            except Exception as e:
+                h, status = host, f"Unhandled error ({type(e).__name__})"
+            results.append((h, status))
+            print_thread_safe(f"{h:30} | {status}")
+
+    # write summary CSV
+    try:
+        with open(args.summary, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["host", "status", "checked_at"])
+            now = datetime.now().isoformat()
+            for h, s in results:
+                writer.writerow([h, s, now])
+        print(f"\nSummary saved to {args.summary}")
+    except Exception as e:
+        print(f"\nCould not write summary CSV: {e}", file=sys.stderr)
+
+    elapsed = datetime.now() - start
+    print(f"Completed in {elapsed.total_seconds():.1f} seconds.")
+
+
+if __name__ == "__main__":
+    main()
