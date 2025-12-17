@@ -1,0 +1,70 @@
+from netmiko import ConnectHandler
+from getpass import getpass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+
+OUTPUT_XLSX = "config_results.xlsx"
+
+# --- Function to configure one device ---
+def configure_device(host, username, password, commands):
+    result = {"Host": host, "Status": "", "Output": ""}
+    try:
+        device = {
+            "device_type": "cisco_ios",
+            "host": host,
+            "username": username,
+            "password": password,
+            "timeout": 60,
+            "global_delay_factor": 2
+        }
+
+        connection = ConnectHandler(**device)
+
+        # Send configuration commands
+        output = connection.send_config_timing(commands)
+
+        # Save configuration
+        save_output = connection.save_config()
+        connection.disconnect()
+
+        result["Status"] = "✅  Success"
+        result["Output"] = output.strip() + "\n" + save_output.strip()
+
+    except Exception as e:
+        result["Status"] = "❌  Failed"
+        result["Output"] = str(e)
+
+    return result
+
+# --- Main script ---
+if __name__ == "__main__":
+    username = input("Enter your SSH username: ")
+    password = getpass("Enter your SSH password: ")
+
+    # Load devices
+    with open("hosts.txt") as f:
+        devices = [line.strip() for line in f if line.strip()]
+
+    # Commands to push
+    commands = [
+        "ip scp server enable",
+        "ip tcp window-size 65535",
+        "ip ssh window-size 65535"
+    ]
+
+    results = []
+
+    # Run concurrently you can define as well a variable. it will launch 15 threads in the same time in this case
+          
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(configure_device, host, username, password, commands): host for host in devices}
+
+        for future in as_completed(futures):
+            res = future.result()
+            print(f"{res['Host']} -> {res['Status']}")
+            results.append(res)
+
+    # Save results to Excel
+    df = pd.DataFrame(results)
+    df.to_excel(OUTPUT_XLSX, index=False)
+    print(f"\n✅  All tasks completed. Results saved to {OUTPUT_XLSX}")
